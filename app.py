@@ -6,121 +6,107 @@ st.set_page_config(page_title="Manifest Converter", page_icon="📦")
 
 st.title("📦 Manifest Converter")
 st.write(
-    "Upload your original manifest Excel. I’ll split **PRODUCT DESCRIPTION** and **HSCODE** into "
-    "one-to-one rows (truncate to the shortest pair per row), keep all other columns, set **TOTAL QTY = 1**, "
-    "and evenly distribute **WEIGHT** and **TOTAL DECLARE VALUE** per **Tracking Number**."
+    "Upload your original manifest Excel. This tool will split `PRODUCT DESCRIPTION` and `HSCODE` into one-to-one rows, "
+    "set `TOTAL QTY = 1`, evenly distribute `WEIGHT` and `TOTAL DECLARE VALUE` per `Tracking Number`, and export to your final template format."
 )
 
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
 @st.cache_data(show_spinner=False)
-def convert_manifest(file_bytes: bytes) -> pd.DataFrame:
-    # Read original workbook (first sheet)
+def convert_manifest_to_template(file_bytes: bytes) -> pd.DataFrame:
+    # Step 1: Read original
     xls = pd.ExcelFile(io.BytesIO(file_bytes))
     df = pd.read_excel(xls, sheet_name=0)
 
-    # Validate required columns
-    required = ["Tracking Number", "PRODUCT DESCRIPTION", "HSCODE"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required column(s): {', '.join(missing)}")
+    # Step 2: Explode PRODUCT DESCRIPTION and HSCODE (truncate to shortest)
+    df["PRODUCT DESCRIPTION"] = df["PRODUCT DESCRIPTION"].astype(str).str.split(",")
+    df["HSCODE"] = df["HSCODE"].astype(str).str.split(",")
+    min_len = [min(len(p), len(h)) for p, h in zip(df["PRODUCT DESCRIPTION"], df["HSCODE"])]
+    df["PRODUCT DESCRIPTION"] = [p[:n] for p, n in zip(df["PRODUCT DESCRIPTION"], min_len)]
+    df["HSCODE"] = [h[:n] for h, n in zip(df["HSCODE"], min_len)]
+    df_expanded = df.loc[df.index.repeat(min_len)].copy()
+    df_expanded["PRODUCT DESCRIPTION"] = [i for sub in df["PRODUCT DESCRIPTION"] for i in sub]
+    df_expanded["HSCODE"] = [i for sub in df["HSCODE"] for i in sub]
+    df_expanded["TOTAL QTY"] = 1
 
-    # Preserve original totals by Tracking Number
-    base = df[["Tracking Number"]].copy()
-    # Bring WEIGHT and TOTAL DECLARE VALUE if present; coerce to numeric
-    for c in ["WEIGHT", "TOTAL DECLARE VALUE"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-            base[c] = df[c]
-    # Use the first non-null per Tracking Number as the original totals
-    base_by_tracking = (
-        base.groupby("Tracking Number")
-        .agg({"WEIGHT": "first", "TOTAL DECLARE VALUE": "first"})
-        .reset_index()
-    )
+    # Step 3: Distribute WEIGHT and DECLARE VALUE evenly per tracking number
+    for col in ["WEIGHT", "TOTAL DECLARE VALUE"]:
+        if col in df_expanded.columns:
+            df_expanded[col] = pd.to_numeric(df_expanded[col], errors="coerce")
+    counts = df_expanded.groupby("Tracking Number").size().rename("_count")
+    df_expanded = df_expanded.merge(counts, on="Tracking Number")
+    df_expanded["WEIGHT"] = df_expanded.groupby("Tracking Number")["WEIGHT"].transform("first") / df_expanded["_count"]
+    df_expanded["TOTAL DECLARE VALUE"] = df_expanded.groupby("Tracking Number")["TOTAL DECLARE VALUE"].transform("first") / df_expanded["_count"]
+    df_expanded.drop(columns="_count", inplace=True)
 
-    # Helper to split comma-separated cells
-    def split_list_cell(x):
-        if pd.isna(x):
-            return []
-        parts = [p.strip() for p in str(x).split(",")]
-        return [p for p in parts if p != ""]
+    # Step 4: Map to template columns
+    province_abbr = {
+        "Beijing": "BJ", "Tianjin": "TJ", "Shanghai": "SH", "Chongqing": "CQ",
+        "Guangdong": "GD", "Guangxi": "GX", "Guizhou": "GZ", "Yunnan": "YN", "Hainan": "HI",
+        "Sichuan": "SC", "Jiangsu": "JS", "Zhejiang": "ZJ", "Anhui": "AH", "Fujian": "FJ",
+        "Jiangxi": "JX", "Shandong": "SD", "Henan": "HA", "Hubei": "HB", "Hunan": "HN",
+        "Hebei": "HE", "Shanxi": "SX", "Inner Mongolia": "NM", "Shaanxi": "SN", "Gansu": "GS",
+        "Qinghai": "QH", "Ningxia": "NX", "Xinjiang": "XJ", "Tibet": "XZ", "Heilongjiang": "HL",
+        "Jilin": "JL", "Liaoning": "LN"
+    }
+    city_to_province = {
+        "Guangzhou": "Guangdong", "Shenzhen": "Guangdong", "Foshan": "Guangdong",
+        "Beijing": "Beijing", "Shanghai": "Shanghai", "Tianjin": "Tianjin",
+        "Chengdu": "Sichuan", "Wuhan": "Hubei", "Hangzhou": "Zhejiang", "Nanjing": "Jiangsu"
+    }
+    template_cols = [
+        "consignor_item_id", "display_id", "receptacle_id", "tracking_number", "sender_name",
+        "sender_orgname", "sender_address1", "sender_address2", "sender_district", "sender_city",
+        "sender_state", "sender_zip5", "sender_zip4", "sender_country", "sender_phone", "sender_email",
+        "sender_url", "recipient_name", "recipient_orgname", "recipient_address1", "recipient_address2",
+        "recipient_district", "recipient_city", "recipient_state", "recipient_zip5", "recipient_zip4",
+        "recipient_country", "recipient_phone", "recipient_email", "recipient_addr_type", "return_name",
+        "return_orgname", "return_address1", "return_address2", "return_district", "return_city",
+        "return_state", "return_zip5", "return_zip4", "return_country", "return_phone", "return_email",
+        "mail_type", "pieces", "weight", "length", "width", "height", "girth", "value", "machinable",
+        "po_box_flag", "gift_flag", "commercial_flag", "customs_quantity_units", "dutiable",
+        "duty_pay_by", "product", "description", "url", "sku", "country_of_origin", "manufacturer",
+        "harmonization_code", "unit_value", "quantity", "total_value", "total_weight"
+    ]
+    col_map = {
+        "receptacle_id": "Bag ID", "consignor_item_id": "BG Number", "tracking_number": "Tracking Number",
+        "sender_name": "SHIPPER", "sender_address1": "SHIPPER ADDRESS", "sender_city": "CITY NAME SHIPPER",
+        "sender_country": "COUNTRY CODE SHIPPER", "recipient_name": "Consignee Name",
+        "recipient_address1": "Consignee Address", "recipient_city": "Consignee City",
+        "recipient_state": "Consignee Province", "recipient_zip5": "Consignee Post Code",
+        "recipient_country": "Country of Destination", "weight": "WEIGHT", "value": "TOTAL DECLARE VALUE",
+        "description": "PRODUCT DESCRIPTION", "harmonization_code": "HSCODE", "unit_value": "TOTAL DECLARE VALUE",
+        "total_value": "TOTAL DECLARE VALUE", "total_weight": "WEIGHT"
+    }
+    result = pd.DataFrame(columns=template_cols)
+    for col in template_cols:
+        src = col_map.get(col)
+        if src:
+            result[col] = df_expanded[src]
+        elif col in ["pieces", "length", "width", "height", "girth", "quantity"]:
+            result[col] = 1
+        else:
+            result[col] = ""
+    result["sender_state"] = result["sender_city"].map(city_to_province).map(province_abbr)
+    return result
 
-    # Build expanded rows (truncate to shortest pair count)
-    carry_cols = df.columns.tolist()
-    rows = []
-    for _, r in df.iterrows():
-        p_list = split_list_cell(r["PRODUCT DESCRIPTION"])
-        h_list = split_list_cell(r["HSCODE"])
-        n = min(len(p_list), len(h_list))
-        if n == 0:
-            continue
-        for i in range(n):
-            new_r = {c: r[c] for c in carry_cols}
-            new_r["PRODUCT DESCRIPTION"] = p_list[i]
-            new_r["HSCODE"] = h_list[i]
-            rows.append(new_r)
-
-    if not rows:
-        return pd.DataFrame(columns=df.columns)
-
-    expanded = pd.DataFrame(rows)
-
-    # Ensure TOTAL QTY exists and set to 1
-    if "TOTAL QTY" not in expanded.columns:
-        expanded["TOTAL QTY"] = 1
-    else:
-        expanded["TOTAL QTY"] = 1
-
-    # Count pairs per Tracking Number after expansion
-    pair_counts = expanded.groupby("Tracking Number").size().rename("pair_count").reset_index()
-    expanded = expanded.merge(pair_counts, on="Tracking Number", how="left")
-
-    # Join the original totals
-    expanded = expanded.merge(base_by_tracking, on="Tracking Number", how="left", suffixes=("", "_ORIG"))
-
-    # Distribute WEIGHT and TOTAL DECLARE VALUE evenly across pairs
-    if "WEIGHT_ORIG" in expanded.columns:
-        expanded["WEIGHT"] = (pd.to_numeric(expanded["WEIGHT_ORIG"], errors="coerce") / expanded["pair_count"]).round(5)
-    if "TOTAL DECLARE VALUE_ORIG" in expanded.columns:
-        expanded["TOTAL DECLARE VALUE"] = (
-            pd.to_numeric(expanded["TOTAL DECLARE VALUE_ORIG"], errors="coerce") / expanded["pair_count"]
-        ).round(2)
-
-    # Drop helper columns
-    expanded.drop(columns=[c for c in ["WEIGHT_ORIG", "TOTAL DECLARE VALUE_ORIG", "pair_count"] if c in expanded.columns],
-                  inplace=True)
-
-    # Put key columns together near the end (optional)
-    def reorder(df_in: pd.DataFrame) -> pd.DataFrame:
-        cols = df_in.columns.tolist()
-        keys = [c for c in ["PRODUCT DESCRIPTION", "HSCODE", "TOTAL QTY", "WEIGHT", "TOTAL DECLARE VALUE"] if c in cols]
-        for c in keys:
-            cols.remove(c)
-        return df_in[cols + keys]
-    return reorder(expanded)
-
-if uploaded is not None:
+if uploaded:
     try:
-        with st.spinner("Converting..."):
-            converted = convert_manifest(uploaded.getvalue())
+        df_final = convert_manifest_to_template(uploaded.getvalue())
         st.success("Conversion complete!")
-        st.dataframe(converted.head(50), use_container_width=True)
+        st.dataframe(df_final.head(50), use_container_width=True)
 
-        # Prepare Excel in memory
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            converted.to_excel(writer, index=False, sheet_name="Converted")
-        buf.seek(0)
+        # Prepare download
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df_final.to_excel(writer, index=False)
+        buffer.seek(0)
 
         st.download_button(
-            "⬇️ Download Converted Excel",
-            data=buf,
-            file_name="manifest_converted.xlsx",
+            label="📂 Download Converted Template",
+            data=buffer,
+            file_name="manifest_converted_template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     except Exception as e:
         st.error(f"Error: {e}")
-        st.stop()
-
-st.caption("Required columns: ‘Tracking Number’, ‘PRODUCT DESCRIPTION’, and ‘HSCODE’.")
